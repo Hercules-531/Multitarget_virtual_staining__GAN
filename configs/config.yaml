@@ -1,0 +1,104 @@
+# MultiStain-GAN Configuration
+# Optimized for NVIDIA H100 40GB GPU
+
+# Model Architecture
+model:
+  image_size: 256
+  latent_dim: 16
+  style_dim: 64
+  num_domains: 4 # ER, PR, Ki67, HER2
+
+  generator:
+    enc_channels: [64, 128, 256, 512]
+    num_res_blocks: 8 # Increased for better quality
+    vit_blocks: 6 # More ViT blocks for global context
+    vit_heads: 8
+    use_pretrained: true
+    use_checkpoint: false # Disable - H100 has enough VRAM
+
+  discriminator:
+    num_scales: 2 # Reduced from 3 to prevent too-small feature maps
+    base_channels: 64
+    num_layers: 3 # Reduced from 5 - prevents 4x4 kernel issues
+    use_spectral_norm: true
+
+  style_encoder:
+    pretrained: true
+    freeze_layers: 2
+
+  mapping_network:
+    num_layers: 6 # Deeper mapping network
+    hidden_dim: 512
+
+# Dataset
+data:
+  root_dir: "D:/IHC4BC (IHC for Breast Cancer) - Compressed Dataset/archive (4)/IHC4BC_Compressed"
+  domains: ["ER", "PR", "Ki67", "Her2"]
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  num_workers: 8 # More workers for faster data loading
+  pin_memory: true
+  paired_only: true
+  paired_reference: true
+
+# Training - Stability-focused configuration
+training:
+  batch_size: 12 # Higher batch for paired fidelity on H100
+  accumulate_grad: 4 # Effective batch = 48
+  epochs: 300
+
+  optimizer:
+    type: AdamW
+    lr_generator: 5.0e-5 # Slightly higher to reduce underfitting
+    lr_discriminator: 1.0e-4 # Keep D stronger for realism
+    beta1: 0.0
+    beta2: 0.99
+    weight_decay: 1.0e-4 # Reduced weight decay
+
+  # Training stability
+  grad_clip_max_norm: 0.5 # Tighter gradient clipping
+
+  scheduler:
+    type: CosineAnnealingLR
+    T_max: 100
+    eta_min: 1.0e-6
+
+  # Loss weights
+  losses:
+    adversarial: 0.5
+    cycle: 15.0
+    style_reconstruction: 1.0
+    style_diversification: 0.1
+    contrastive_nce: 2.0
+    perceptual: 1.0
+    ssim: 1.0
+    nce_temperature: 0.1
+    nce_logit_clip: 50.0
+    ssim_eps: 1.0e-6
+
+  # Regularization - increased for stability
+  r1_gamma: 5.0 # Moderate regularization for realism
+  r1_interval: 16 # Apply R1 every N steps for stability
+  ema_decay: 0.999
+
+# Logging
+logging:
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
+  sample_dir: "./samples"
+  log_every: 100
+  save_every: 5000
+  sample_every: 500 # More frequent samples
+
+# Evaluation
+evaluation:
+  metrics: ["fid", "ssim", "lpips"]
+  num_samples: 1000
+
+# Hardware & Optimization - H100 Specific
+device: "cuda"
+seed: 42
+mixed_precision: true # BF16 on H100 is excellent
+compile_model: true # torch.compile for max speed
+cudnn_benchmark: true

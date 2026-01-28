@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data/artifacts
+logs/
+checkpoints/
+samples/
+training_results.zip
+
+# Large datasets (keep code in data/)
+data/IHC4BC_Compressed/
+
+# OS
+.DS_Store
+Thumbs.db
