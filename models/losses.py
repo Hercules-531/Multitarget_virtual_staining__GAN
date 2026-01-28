@@ -166,7 +166,13 @@ class PerceptualLoss(nn.Module):
         """Compute perceptual loss."""
         # Disable autocast and run VGG in float32 (mixed precision fix)
         input_dtype = generated.dtype
-        with torch.cuda.amp.autocast(enabled=False):
+        device = generated.device
+        
+        # Ensure VGG blocks are on the same device
+        if next(self.blocks[0].parameters()).device != device:
+            self.blocks = self.blocks.to(device)
+        
+        with torch.amp.autocast('cuda', enabled=False):
             generated = self._normalize(generated.float())
             target = self._normalize(target.float())
             
