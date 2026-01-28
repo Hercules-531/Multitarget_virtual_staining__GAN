@@ -222,6 +222,9 @@ class SSIMLoss(nn.Module):
         target: torch.Tensor,
     ) -> torch.Tensor:
         """Compute SSIM loss (1 - SSIM)."""
+        # Ensure window is on the same device and dtype
+        window = self.window.to(generated.device, generated.dtype)
+        
         # Normalize to [0, 1]
         generated = generated.clamp(-1.0, 1.0)
         target = target.clamp(-1.0, 1.0)
@@ -231,16 +234,16 @@ class SSIMLoss(nn.Module):
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
         
-        mu1 = F.conv2d(generated, self.window, padding=self.window_size // 2, groups=self.channel)
-        mu2 = F.conv2d(target, self.window, padding=self.window_size // 2, groups=self.channel)
+        mu1 = F.conv2d(generated, window, padding=self.window_size // 2, groups=self.channel)
+        mu2 = F.conv2d(target, window, padding=self.window_size // 2, groups=self.channel)
         
         mu1_sq = mu1 ** 2
         mu2_sq = mu2 ** 2
         mu1_mu2 = mu1 * mu2
         
-        sigma1_sq = F.conv2d(generated ** 2, self.window, padding=self.window_size // 2, groups=self.channel) - mu1_sq
-        sigma2_sq = F.conv2d(target ** 2, self.window, padding=self.window_size // 2, groups=self.channel) - mu2_sq
-        sigma12 = F.conv2d(generated * target, self.window, padding=self.window_size // 2, groups=self.channel) - mu1_mu2
+        sigma1_sq = F.conv2d(generated ** 2, window, padding=self.window_size // 2, groups=self.channel) - mu1_sq
+        sigma2_sq = F.conv2d(target ** 2, window, padding=self.window_size // 2, groups=self.channel) - mu2_sq
+        sigma12 = F.conv2d(generated * target, window, padding=self.window_size // 2, groups=self.channel) - mu1_mu2
 
         sigma1_sq = sigma1_sq.clamp(min=0.0)
         sigma2_sq = sigma2_sq.clamp(min=0.0)
