@@ -164,21 +164,24 @@ class PerceptualLoss(nn.Module):
         target: torch.Tensor,
     ) -> torch.Tensor:
         """Compute perceptual loss."""
-        # Convert to float32 for VGG (handles mixed precision)
+        # Disable autocast and run VGG in float32 (mixed precision fix)
         input_dtype = generated.dtype
-        generated = self._normalize(generated.float())
-        target = self._normalize(target.float())
+        with torch.cuda.amp.autocast(enabled=False):
+            generated = self._normalize(generated.float())
+            target = self._normalize(target.float())
+            
+            loss = 0.0
+            x_gen = generated
+            x_tar = target
+            
+            for block in self.blocks:
+                x_gen = block(x_gen)
+                x_tar = block(x_tar)
+                loss += self.l1(x_gen, x_tar)
+            
+            loss = loss / len(self.blocks)
         
-        loss = 0.0
-        x_gen = generated
-        x_tar = target
-        
-        for block in self.blocks:
-            x_gen = block(x_gen)
-            x_tar = block(x_tar)
-            loss += self.l1(x_gen, x_tar)
-        
-        return (loss / len(self.blocks)).to(input_dtype)
+        return loss.to(input_dtype)
 
 
 class SSIMLoss(nn.Module):
