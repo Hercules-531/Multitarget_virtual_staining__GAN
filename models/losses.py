@@ -154,7 +154,9 @@ class PerceptualLoss(nn.Module):
         """Normalize from [-1, 1] to ImageNet normalization."""
         x = x.clamp(-1.0, 1.0)
         x = (x + 1) / 2  # [-1, 1] -> [0, 1]
-        return (x - self.mean) / self.std
+        mean = self.mean.to(x.device, x.dtype)
+        std = self.std.to(x.device, x.dtype)
+        return (x - mean) / std
     
     def forward(
         self,
@@ -162,8 +164,10 @@ class PerceptualLoss(nn.Module):
         target: torch.Tensor,
     ) -> torch.Tensor:
         """Compute perceptual loss."""
-        generated = self._normalize(generated)
-        target = self._normalize(target)
+        # Convert to float32 for VGG (handles mixed precision)
+        input_dtype = generated.dtype
+        generated = self._normalize(generated.float())
+        target = self._normalize(target.float())
         
         loss = 0.0
         x_gen = generated
@@ -174,7 +178,7 @@ class PerceptualLoss(nn.Module):
             x_tar = block(x_tar)
             loss += self.l1(x_gen, x_tar)
         
-        return loss / len(self.blocks)
+        return (loss / len(self.blocks)).to(input_dtype)
 
 
 class SSIMLoss(nn.Module):
