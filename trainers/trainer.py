@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
@@ -132,16 +133,20 @@ class Trainer:
         opt_cfg = train_cfg.get('optimizer', {})
         lr_g = opt_cfg.get('lr_generator', 1e-4)
         lr_d = opt_cfg.get('lr_discriminator', 4e-4)
+        lr_style = opt_cfg.get('lr_style_encoder', lr_g * 0.1)  # Lower LR for unfrozen style encoder
         betas = (opt_cfg.get('beta1', 0.0), opt_cfg.get('beta2', 0.99))
         weight_decay = opt_cfg.get('weight_decay', 1e-2)
         
         OptClass = torch.optim.AdamW if opt_cfg.get('type', 'AdamW') == 'AdamW' else torch.optim.Adam
         
+        # Use parameter groups with different learning rates
+        # Style encoder gets lower LR since it's now unfrozen
         self.optimizer_g = OptClass(
-            list(self.generator.parameters()) +
-            list(self.style_encoder.parameters()) +
-            list(self.mapping_network.parameters()),
-            lr=lr_g,
+            [
+                {'params': self.generator.parameters(), 'lr': lr_g},
+                {'params': self.mapping_network.parameters(), 'lr': lr_g},
+                {'params': self.style_encoder.parameters(), 'lr': lr_style},  # Lower LR
+            ],
             betas=betas,
             weight_decay=weight_decay,
         )
@@ -284,6 +289,10 @@ class Trainer:
         noise_decay = max(0.0, 1.0 - self.global_step / 50000)
         current_noise_std = noise_std * noise_decay
         
+        # Color jitter for D inputs only (forces D to be color-agnostic, pushing G to diversify)
+        # Apply to ~30% of batches for regularization without destabilizing training
+        use_color_jitter = (self.global_step % 3 == 0)  # Every 3rd step
+        
         # ========== Train Discriminator ==========
         z = torch.randn(batch_size, self.config['model']['latent_dim'], device=self.device)
         style_random = self.mapping_network(z, target_domain)
@@ -303,6 +312,17 @@ class Trainer:
         else:
             real_noisy = real
             fake_noisy = fake.detach()
+        
+        # Apply color jitter to D inputs only (not G) to force color diversity
+        # This makes D color-agnostic, preventing G from producing uniform colors
+        if use_color_jitter:
+            # Random color adjustments (small to avoid instability)
+            brightness = 0.1 * (torch.rand(1, device=self.device).item() - 0.5)
+            contrast = 1.0 + 0.1 * (torch.rand(1, device=self.device).item() - 0.5)
+            
+            # Apply same jitter to both real and fake for consistency
+            real_noisy = (real_noisy * contrast + brightness).clamp(-1, 1)
+            fake_noisy = (fake_noisy * contrast + brightness).clamp(-1, 1)
         
         with autocast(device_type='cuda', enabled=self.use_amp):
             real_scores, real_domain_logits = self.discriminator(real_noisy)
@@ -391,6 +411,20 @@ class Trainer:
             div_loss = self.criterion.style_div(fake_z1, fake_z2, style_z1, style_z2)
             g_losses['ds'] = self.config['training']['losses'].get('style_diversification', 1.0) * div_loss
             g_losses['total'] = g_losses['total'] + g_losses['ds']
+            
+            # CRITICAL: Latent entropy regularization for mapping network
+            # Forces style codes to have high entropy (diverse outputs) instead of collapsing
+            # Compute entropy of style_z1 distribution to encourage spread
+            lambda_entropy = self.config['training']['losses'].get('latent_entropy', 0.1)
+            if lambda_entropy > 0:
+                # Normalize styles to probability-like distribution
+                style_probs = F.softmax(style_z1, dim=-1)
+                # Entropy: - sum(p * log(p)), higher = more diverse
+                entropy = -(style_probs * torch.log(style_probs + 1e-8)).sum(dim=-1).mean()
+                # We want to MAXIMIZE entropy, so negate it (minimize negative entropy)
+                entropy_loss = -lambda_entropy * entropy
+                g_losses['entropy'] = entropy_loss
+                g_losses['total'] = g_losses['total'] + entropy_loss
             
             g_loss = g_losses['total'] / self.accumulate_grad
         
