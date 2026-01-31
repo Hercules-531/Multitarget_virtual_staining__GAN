@@ -6,7 +6,6 @@ PatchGAN discriminator operating at multiple scales for better realism.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List, Tuple
 
 
@@ -15,6 +14,45 @@ def spectral_norm(module: nn.Module, use: bool = True) -> nn.Module:
     if use:
         return nn.utils.spectral_norm(module)
     return module
+
+
+class MinibatchStdDev(nn.Module):
+    """
+    Minibatch Standard Deviation layer.
+    
+    Computes the standard deviation across the batch for each spatial location,
+    then averages across spatial dimensions and appends as an extra channel.
+    This explicitly penalizes lack of variance in generated batches,
+    helping prevent mode collapse.
+    """
+    
+    def __init__(self, group_size: int = 4):
+        super().__init__()
+        self.group_size = group_size
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        # Adjust group size if batch is smaller
+        G = min(self.group_size, B)
+        if B % G != 0:
+            G = 1  # Fall back to computing std across whole batch
+        
+        # Reshape: (B, C, H, W) -> (G, B//G, C, H, W)
+        y = x.view(G, B // G, C, H, W)
+        
+        # Compute std across batch dimension within each group
+        y = y - y.mean(dim=0, keepdim=True)  # Center
+        y = (y ** 2).mean(dim=0)  # Variance
+        y = (y + 1e-8).sqrt()  # Std with epsilon for stability
+        
+        # Average over channels and spatial dims: (B//G, C, H, W) -> (B//G, 1, 1, 1)
+        y = y.mean(dim=[1, 2, 3], keepdim=True)
+        
+        # Tile to match batch size: (B//G, 1, 1, 1) -> (B, 1, H, W)
+        y = y.repeat(G, 1, H, W)
+        
+        # Concatenate as extra channel
+        return torch.cat([x, y], dim=1)
 
 
 class DiscriminatorBlock(nn.Module):
@@ -84,9 +122,13 @@ class PatchDiscriminator(nn.Module):
         
         self.main = nn.Sequential(*layers)
         
-        # Output heads - use 3x3 kernel for compatibility with smaller feature maps
+        # Minibatch StdDev - CRITICAL for preventing mode collapse!
+        # Explicitly penalizes generator if all outputs look the same
+        self.minibatch_std = MinibatchStdDev(group_size=4)
+        
+        # Output heads - use 3x3 kernel, +1 channel for minibatch std
         self.real_fake = spectral_norm(
-            nn.Conv2d(channels, 1, 3, 1, 1),  # Changed from 4x4 to 3x3
+            nn.Conv2d(channels + 1, 1, 3, 1, 1),  # +1 for minibatch std channel
             use_spectral_norm
         )
         
@@ -110,8 +152,10 @@ class PatchDiscriminator(nn.Module):
             domain_logits: Domain classification logits (B, num_domains)
         """
         features = self.main(x)
-        real_fake = self.real_fake(features)
-        domain_logits = self.domain_cls(features)
+        # Apply minibatch std before final classification
+        features_with_std = self.minibatch_std(features)
+        real_fake = self.real_fake(features_with_std)
+        domain_logits = self.domain_cls(features)  # Domain cls uses original features
         return real_fake, domain_logits
     
     def get_features(self, x: torch.Tensor) -> torch.Tensor:

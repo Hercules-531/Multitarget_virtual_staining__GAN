@@ -4,8 +4,8 @@
 # Model Architecture
 model:
   image_size: 256
-  latent_dim: 16
-  style_dim: 64
+  latent_dim: 64 # INCREASED from 16 - more diversity capacity
+  style_dim: 256 # INCREASED from 64 - better domain separation (CRITICAL!)
   num_domains: 4 # ER, PR, Ki67, HER2
 
   generator:
@@ -41,6 +41,7 @@ data:
   pin_memory: true
   paired_only: true
   paired_reference: true
+  balanced_sampling: true # NEW: Balance samples across domains to prevent collapse
 
 # Training - Stability-focused configuration
 training:
@@ -50,36 +51,40 @@ training:
 
   optimizer:
     type: AdamW
-    lr_generator: 5.0e-5 # Slightly higher to reduce underfitting
-    lr_discriminator: 1.0e-4 # Keep D stronger for realism
-    beta1: 0.0
-    beta2: 0.99
-    weight_decay: 1.0e-4 # Reduced weight decay
+    lr_generator: 1.0e-4 # Higher G learning rate to catch up with D
+    lr_discriminator: 5.0e-5 # Lower D learning rate to give G a chance
+    beta1: 0.5 # CHANGED from 0.0 - adds momentum for stability
+    beta2: 0.999 # CHANGED from 0.99 - smoother second moment
+    weight_decay: 1.0e-5 # Reduced for generator to explore more
 
-  # Training stability
-  grad_clip_max_norm: 0.5 # Tighter gradient clipping
+  # Training stability  
+  grad_clip_max_norm: 1.0 # Slightly looser for G gradient flow
+  noise_std: 0.1 # Inject noise to D inputs for regularization
 
   scheduler:
     type: CosineAnnealingLR
     T_max: 100
     eta_min: 1.0e-6
 
-  # Loss weights
+  # Loss weights - REBALANCED to fix mode collapse
   losses:
-    adversarial: 0.5
-    cycle: 15.0
+    adversarial: 2.0 # INCREASED - stronger signal to generator
+    cycle: 5.0 # REDUCED from 15 - was causing averaging/blur
     style_reconstruction: 1.0
-    style_diversification: 0.1
-    contrastive_nce: 2.0
-    perceptual: 1.0
-    ssim: 1.0
-    nce_temperature: 0.1
+    style_diversification: 1.0 # INCREASED from 0.1 - encourage diversity
+    contrastive_nce: 1.0 # Reduced slightly
+    perceptual: 2.0 # INCREASED - better feature matching
+    ssim: 0.5 # Reduced - can conflict with style transfer
+    l1_reconstruction: 5.0 # Direct color matching with target
+    gradient_matching: 3.0 # Edge preservation
+    sharpness_matching: 2.0 # Prevent blur
+    nce_temperature: 0.07 # Standard temperature
     nce_logit_clip: 50.0
     ssim_eps: 1.0e-6
 
-  # Regularization - increased for stability
-  r1_gamma: 5.0 # Moderate regularization for realism
-  r1_interval: 16 # Apply R1 every N steps for stability
+  # Regularization - adjusted for better G/D balance
+  r1_gamma: 10.0 # INCREASED - regularize D more to help G
+  r1_interval: 4 # MORE FREQUENT - apply R1 every 4 steps
   ema_decay: 0.999
 
 # Logging

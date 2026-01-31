@@ -36,6 +36,8 @@ class IHC4BCDataset(Dataset):
         │       ├── Ki67/
         │       └── PR/
         └── Labels/
+    
+    IMPORTANT: For paired training, source/target must have synchronized augmentations!
     """
     
     # Domain names as they appear in folder structure
@@ -49,18 +51,21 @@ class IHC4BCDataset(Dataset):
         split: str = "train",
         transform=None,
         target_transform=None,
+        paired_transform=None,  # NEW: synchronized transform for paired data
         domains: Optional[List[str]] = None,
         paired: bool = True,
         paired_only: bool = False,
         paired_reference: bool = False,
         image_size: int = 256,
+        subset_fraction: float = 1.0,  # Use fraction of dataset for quick prototyping
     ):
         """
         Args:
             root_dir: Root directory of dataset (IHC4BC_Compressed folder)
             split: One of 'train', 'val', 'test'
-            transform: Transforms for source (H&E) images
-            target_transform: Transforms for target (IHC) images
+            transform: Transforms for source (H&E) images (unpaired mode)
+            target_transform: Transforms for target (IHC) images (unpaired mode)
+            paired_transform: Synchronized transforms for paired source+target (L1 loss)
             domains: List of domains to include (default: all)
             paired: If True, return paired H&E-IHC samples
             image_size: Size to resize images to
@@ -69,11 +74,13 @@ class IHC4BCDataset(Dataset):
         self.split = split
         self.transform = transform
         self.target_transform = target_transform
+        self.paired_transform = paired_transform  # NEW
         self.domains = domains or self.DOMAINS
         self.paired = paired
         self.paired_only = paired_only
         self.paired_reference = paired_reference
         self.image_size = image_size
+        self.subset_fraction = subset_fraction
         
         # Find the Images directory
         self.images_dir = self.root_dir / "Images"
@@ -178,6 +185,12 @@ class IHC4BCDataset(Dataset):
         random.seed(42 + hash(self.split))
         random.shuffle(samples)
         
+        # Apply subset fraction for quick prototyping
+        if self.subset_fraction < 1.0:
+            n_subset = max(1, int(len(samples) * self.subset_fraction))
+            samples = samples[:n_subset]
+            print(f"  Using {self.subset_fraction*100:.0f}% subset: {n_subset} samples")
+        
         return samples
     
     def _build_domain_index(self) -> Dict[str, List[Path]]:
@@ -220,43 +233,62 @@ class IHC4BCDataset(Dataset):
         sample = self.samples[idx]
         
         # Load H&E (source) image
-        source = self._load_image(sample["he_path"])
+        source_pil = self._load_image(sample["he_path"])
         
         domain = sample["domain"]
         domain_idx = sample["domain_idx"]
         
         # Load target IHC image if available
-        target = None
+        target_pil = None
         if self.paired and "ihc_path" in sample:
-            target = self._load_image(sample["ihc_path"])
+            target_pil = self._load_image(sample["ihc_path"])
         
         # Reference image for style
-        if self.paired_reference and target is not None:
-            reference = target
+        if self.paired_reference and target_pil is not None:
+            reference_pil = target_pil
         else:
             ref_images = self.domain_images.get(domain, [])
             if ref_images:
                 ref_path = random.choice(ref_images)
-                reference = self._load_image(ref_path)
+                reference_pil = self._load_image(ref_path)
             else:
-                reference = target if target is not None else source
+                reference_pil = target_pil if target_pil is not None else source_pil
         
-        # Apply transforms
-        if self.transform:
-            source = self.transform(source)
+        # Apply transforms - CRITICAL: synchronized for paired data with L1 loss!
+        if self.paired_transform is not None and target_pil is not None:
+            # Use synchronized augmentation for paired source/target
+            source_np = np.array(source_pil)
+            target_np = np.array(target_pil)
+            reference_np = np.array(reference_pil)
+            
+            # Apply SAME random augmentation to all three images
+            augmented = self.paired_transform(
+                image=source_np,
+                target=target_np,
+                reference=reference_np
+            )
+            source = augmented['image']
+            target = augmented['target']
+            reference = augmented['reference']
         else:
-            source = self._to_tensor(source)
-        
-        if target is not None:
-            if self.target_transform:
-                target = self.target_transform(target)
+            # Fallback to separate transforms (for unpaired or validation)
+            if self.transform:
+                source = self.transform(source_pil)
             else:
-                target = self._to_tensor(target)
-        
-        if self.transform:
-            reference = self.transform(reference)
-        else:
-            reference = self._to_tensor(reference)
+                source = self._to_tensor(source_pil)
+            
+            if target_pil is not None:
+                if self.target_transform:
+                    target = self.target_transform(target_pil)
+                else:
+                    target = self._to_tensor(target_pil)
+            else:
+                target = None
+            
+            if self.transform:
+                reference = self.transform(reference_pil)
+            else:
+                reference = self._to_tensor(reference_pil)
         
         result = {
             "source": source,
@@ -292,20 +324,55 @@ def get_dataloader(
     batch_size: int = 4,
     num_workers: int = 4,
     transform=None,
+    paired_transform=None,  # Synchronized transforms for paired data
+    balanced_sampling: bool = True,  # NEW: balance domains in batches
     **kwargs
 ) -> DataLoader:
     """Create a DataLoader for IHC4BC dataset."""
+    from torch.utils.data import WeightedRandomSampler
+    
     dataset = IHC4BCDataset(
         root_dir=root_dir,
         split=split,
         transform=transform,
+        paired_transform=paired_transform,
         **kwargs
     )
+    
+    sampler = None
+    shuffle = (split == "train")
+    
+    # Use weighted sampling to balance domain distribution (prevents mode collapse to dominant class)
+    if balanced_sampling and split == "train" and len(dataset) > 0:
+        # Count samples per domain
+        domain_counts = {}
+        for sample in dataset.samples:
+            d = sample['domain']
+            domain_counts[d] = domain_counts.get(d, 0) + 1
+        
+        # Compute weights (inverse frequency)
+        total = sum(domain_counts.values())
+        domain_weights = {d: total / (len(domain_counts) * count) for d, count in domain_counts.items()}
+        
+        # Assign weight to each sample
+        sample_weights = [domain_weights[s['domain']] for s in dataset.samples]
+        
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(dataset),
+            replacement=True
+        )
+        shuffle = False  # WeightedRandomSampler handles shuffling
+        
+        print(f"  Domain-balanced sampling enabled:")
+        for d, w in domain_weights.items():
+            print(f"    {d}: {domain_counts[d]} samples, weight={w:.3f}")
     
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(split == "train"),
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=(split == "train"),

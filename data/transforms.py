@@ -12,7 +12,7 @@ from albumentations.pytorch import ToTensorV2
 
 
 def get_train_transforms(image_size: int = 256):
-    """Training transforms with augmentation."""
+    """Training transforms with augmentation (for unpaired data only)."""
     return A.Compose([
         A.Resize(image_size, image_size),
         A.HorizontalFlip(p=0.5),
@@ -45,6 +45,28 @@ def get_train_transforms(image_size: int = 256):
         A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ToTensorV2(),
     ])
+
+
+def get_paired_train_transforms(image_size: int = 256):
+    """
+    Training transforms for PAIRED data.
+    
+    CRITICAL: For paired training with L1 loss, source and target must have
+    IDENTICAL spatial transformations. We only use geometric augmentations
+    that can be applied consistently to both images.
+    
+    NO color jitter - we want to learn the color mapping from H&E to IHC!
+    """
+    return A.Compose([
+        A.Resize(image_size, image_size),
+        # Only geometric augmentations (applied identically to source & target)
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        # Normalize to [-1, 1]
+        A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ToTensorV2(),
+    ], additional_targets={'target': 'image', 'reference': 'image'})
 
 
 def get_val_transforms(image_size: int = 256):

@@ -21,12 +21,19 @@ class AdaIN(nn.Module):
         super().__init__()
         self.norm = nn.InstanceNorm2d(num_features, affine=False)
         self.fc = nn.Linear(style_dim, num_features * 2)
+        # Initialize to have stronger modulation from the start
+        nn.init.zeros_(self.fc.bias)
+        # Scale weights so gamma starts around 1.0 (stronger modulation)
+        nn.init.normal_(self.fc.weight, 0, 0.1)
     
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         h = self.fc(style)
         h = h.view(h.size(0), h.size(1), 1, 1)
         gamma, beta = h.chunk(2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        # Use exp(gamma) for always-positive scaling with stronger effect
+        # This ensures style always modulates the output significantly
+        scale = torch.exp(gamma.clamp(-2, 2))  # Clamp for stability, range [0.13, 7.4]
+        return scale * self.norm(x) + beta
 
 
 class ResBlock(nn.Module):
@@ -74,12 +81,13 @@ class ResBlock(nn.Module):
 
 
 class EfficientViTBlock(nn.Module):
-    """Efficient Vision Transformer block using windowed attention."""
+    """Efficient Vision Transformer block with attention dropout."""
     
-    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0):
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, attn_drop: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
+        self.attn_drop = nn.Dropout(attn_drop)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
@@ -88,19 +96,23 @@ class EfficientViTBlock(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
             nn.Dropout(0.1),
         )
+        # Learnable scale for residual - helps with gradient flow
+        self.gamma1 = nn.Parameter(torch.ones(dim) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(dim) * 0.1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W) -> (B, H*W, C)
         B, C, H, W = x.shape
         x_flat = x.flatten(2).transpose(1, 2)
         
-        # Self-attention
+        # Self-attention with learnable residual scale
         x_norm = self.norm1(x_flat)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x_flat = x_flat + attn_out
+        attn_out = self.attn_drop(attn_out)
+        x_flat = x_flat + self.gamma1 * attn_out
         
-        # MLP
-        x_flat = x_flat + self.mlp(self.norm2(x_flat))
+        # MLP with learnable residual scale
+        x_flat = x_flat + self.gamma2 * self.mlp(self.norm2(x_flat))
         
         # Reshape back
         return x_flat.transpose(1, 2).reshape(B, C, H, W)
@@ -274,27 +286,20 @@ class Generator(nn.Module):
         Args:
             x: Input image (B, C, H, W) in range [-1, 1]
             style: Style code (B, style_dim)
-            return_features: If True, return intermediate features for NCE loss
+            return_features: If True, return multi-scale encoder features for NCE loss
         
         Returns:
             Generated image (B, C, H, W) in range [-1, 1]
+            If return_features: also returns list of encoder features at multiple scales
         """
-        features = []
-        
         # Encode with pretrained ResNet
         enc_features = self.encoder(x)
         
         # Get bottleneck features
         out = self.enc_proj(enc_features[-1])
         
-        if return_features:
-            features.append(out)
-        
         # ViT for global context
         out = self._run_vit(out)
-        
-        if return_features:
-            features.append(out)
         
         # Residual blocks with style injection
         for res_block in self.res_blocks:
@@ -303,13 +308,13 @@ class Generator(nn.Module):
             else:
                 out = res_block(out, style)
         
-        # Decoder with skip connections
+        # Decoder with skip connections - VERY strong skip weights preserve spatial structure
         skip_idx = [3, 2, 1]  # Indices for 256, 128, 64 channel features
         for i, dec in enumerate(self.decoder):
             out = dec(out, style)
             if i < len(self.skip_projs):
                 skip = self.skip_projs[i](enc_features[skip_idx[i]])
-                out = out + skip * 0.3
+                out = out + skip  # Full skip connections (1.0) - critical for structure
         
         # Final upsampling: 64 -> 128 -> 256
         out = self.upsample1(out)
@@ -317,7 +322,9 @@ class Generator(nn.Module):
         out = self.to_rgb(out)
         
         if return_features:
-            return out, features
+            # Return multi-scale encoder features (not post-generation features)
+            # These are used for NCE loss to compare source vs fake structure
+            return out, enc_features
         return out
     
     def encode(self, x: torch.Tensor) -> torch.Tensor:

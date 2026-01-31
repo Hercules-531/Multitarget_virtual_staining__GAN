@@ -5,8 +5,6 @@ Handles multi-domain virtual staining training with all loss components.
 Includes optimizations: mixed precision, gradient accumulation, EMA, and more.
 """
 
-import os
-import copy
 from pathlib import Path
 from typing import Dict, Optional
 import torch
@@ -15,7 +13,6 @@ from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import yaml
 
 from models import Generator, MultiScaleDiscriminator, StyleEncoder, MappingNetwork
 from models.losses import MultiStainLoss
@@ -193,9 +190,15 @@ class Trainer:
             lambda_nce=loss_cfg.get('contrastive_nce', 1.0),
             lambda_perc=loss_cfg.get('perceptual', 0.5),
             lambda_ssim=loss_cfg.get('ssim', 0.5),
+            lambda_l1=loss_cfg.get('l1_reconstruction', 10.0),
+            lambda_grad=loss_cfg.get('gradient_matching', 5.0),  # Edge/structure preservation
+            lambda_sharp=loss_cfg.get('sharpness_matching', 5.0),  # Prevent blurry outputs
             nce_temperature=loss_cfg.get('nce_temperature', 0.07),
             nce_logit_clip=loss_cfg.get('nce_logit_clip', 50.0),
             ssim_eps=loss_cfg.get('ssim_eps', 1e-6),
+            # NEW: Color-specific losses for color collapse prevention
+            lambda_color_hist=loss_cfg.get('color_histogram', 5.0),  # Histogram matching
+            lambda_color_mom=loss_cfg.get('color_moments', 2.0),     # Color moments matching
         )
         
         # Mixed precision
@@ -267,11 +270,21 @@ class Trainer:
         if target is not None:
             target = target.to(self.device, non_blocking=True)
         
+        # Check for NaN inputs (data corruption)
+        if torch.isnan(source).any() or torch.isnan(reference).any():
+            print("WARNING: NaN detected in input data, skipping batch")
+            return {'d_total': 0.0, 'g_total': 0.0}
+        
         batch_size = source.size(0)
         is_last_accum = (accum_step + 1) == self.accumulate_grad
         
+        # Instance noise for discriminator regularization (helps prevent mode collapse)
+        noise_std = self.config['training'].get('noise_std', 0.05)  # Reduced from 0.1
+        # Decay noise over training (annealed instance noise)
+        noise_decay = max(0.0, 1.0 - self.global_step / 50000)
+        current_noise_std = noise_std * noise_decay
+        
         # ========== Train Discriminator ==========
-        # Generate random style
         z = torch.randn(batch_size, self.config['model']['latent_dim'], device=self.device)
         style_random = self.mapping_network(z, target_domain)
         
@@ -282,33 +295,51 @@ class Trainer:
         do_r1 = (self.global_step % self.r1_interval == 0) and (accum_step == 0)
         real.requires_grad_(do_r1)
         
-        # Compute discriminator forward pass (can use AMP)
-        with autocast(device_type='cuda', enabled=self.use_amp):
-            real_scores, real_domain_logits = self.discriminator(real)
-            fake_scores, _ = self.discriminator(fake.detach())
+        # Add instance noise to D inputs (regularization to prevent mode collapse)
+        # Always apply during training (train_step is only called during training)
+        if current_noise_std > 0:
+            real_noisy = real + current_noise_std * torch.randn_like(real)
+            fake_noisy = fake.detach() + current_noise_std * torch.randn_like(fake)
+        else:
+            real_noisy = real
+            fake_noisy = fake.detach()
         
-        # Compute adversarial and domain losses (outside AMP for R1 stability)
-        # Cast scores to float32 for stable loss computation
+        with autocast(device_type='cuda', enabled=self.use_amp):
+            real_scores, real_domain_logits = self.discriminator(real_noisy)
+            fake_scores, _ = self.discriminator(fake_noisy)
+        
+        # Cast to float32 for stable loss computation
         real_scores_fp32 = [s.float() for s in real_scores]
         fake_scores_fp32 = [s.float() for s in fake_scores]
         
         d_losses = self.criterion.discriminator_loss(
             real_scores_fp32, fake_scores_fp32,
-            [l.float() for l in real_domain_logits], target_domain,
+            [logit.float() for logit in real_domain_logits], target_domain,
             real_images=real if do_r1 else None,
             r1_gamma=self.config['training'].get('r1_gamma', 1.0),
         )
         
-        # Clamp total loss to prevent explosion
-        d_loss = torch.clamp(d_losses['total'], max=100.0) / self.accumulate_grad
+        d_loss = d_losses['total'] / self.accumulate_grad
+        
+        # Check for NaN loss before backward
+        if not torch.isfinite(d_loss):
+            print(f"WARNING: NaN/Inf in D loss at step {self.global_step}, skipping batch")
+            self.optimizer_g.zero_grad()
+            self.optimizer_d.zero_grad()
+            return {'d_total': float('nan'), 'g_total': float('nan')}
         
         if self.use_amp:
             self.scaler.scale(d_loss).backward()
             if is_last_accum:
                 self.scaler.unscale_(self.optimizer_d)
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.grad_clip_max_norm)
-                self.scaler.step(self.optimizer_d)
+                # Check for NaN gradients
+                d_grad_norm = torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.grad_clip_max_norm)
+                if torch.isfinite(d_grad_norm):
+                    self.scaler.step(self.optimizer_d)
+                else:
+                    print(f"WARNING: NaN grad in D at step {self.global_step}, skipping update")
                 self.optimizer_d.zero_grad()
+                # Note: scaler.update() called after G step
         else:
             d_loss.backward()
             if is_last_accum:
@@ -327,7 +358,8 @@ class Trainer:
         style_z2 = self.mapping_network(z2, target_domain)
         
         with autocast(device_type='cuda', enabled=self.use_amp):
-            fake_ref, source_features = self.generator(source, style_ref, return_features=True)
+            # Generate fake image and get encoder features from SOURCE
+            fake_ref, source_enc_features = self.generator(source, style_ref, return_features=True)
             fake_z1 = self.generator(source, style_z1)
             fake_z2 = self.generator(source, style_z2)
             
@@ -337,33 +369,49 @@ class Trainer:
             reconstructed = self.generator(fake_ref, style_original)
             
             style_gen = self.style_encoder(fake_ref, target_domain)
-            if target is not None:
-                _, target_features = self.generator(target, style_ref, return_features=True)
-            else:
-                target_features = None
             
-            fake_scores_g, _ = self.discriminator(fake_ref)
+            # Get encoder features from FAKE for NCE (compare source encoder vs fake encoder)
+            # This encourages structural consistency between input and output
+            _, fake_enc_features = self.generator(fake_ref, style_ref, return_features=True)
+            
+            # Get scores AND domain logits from fake images
+            # Domain logits on fakes force G to produce domain-specific outputs
+            fake_scores_g, fake_domain_logits = self.discriminator(fake_ref)
             
             g_losses = self.criterion.generator_loss(
-                fake_scores_g, source, reconstructed,
+                [s.float() for s in fake_scores_g], source, reconstructed,
                 style_ref, style_gen,
-                source_features, target_features,
+                source_enc_features, fake_enc_features,  # NCE: source encoder vs fake encoder
                 fake=fake_ref, target=target,
+                fake_domain_logits=[logit.float() for logit in fake_domain_logits],  # Aux domain loss
+                target_domain=target_domain,  # Target domain labels
             )
             
+            # Style diversification loss
             div_loss = self.criterion.style_div(fake_z1, fake_z2, style_z1, style_z2)
             g_losses['ds'] = self.config['training']['losses'].get('style_diversification', 1.0) * div_loss
             g_losses['total'] = g_losses['total'] + g_losses['ds']
+            
             g_loss = g_losses['total'] / self.accumulate_grad
+        
+        # Check for NaN loss before backward
+        if not torch.isfinite(g_loss):
+            print(f"WARNING: NaN/Inf in G loss at step {self.global_step}, skipping batch")
+            self.optimizer_g.zero_grad()
+            self.optimizer_d.zero_grad()
+            return {'d_total': float('nan'), 'g_total': float('nan')}
         
         if self.use_amp:
             self.scaler.scale(g_loss).backward()
             if is_last_accum:
                 self.scaler.unscale_(self.optimizer_g)
                 g_params = list(self.generator.parameters()) + list(self.style_encoder.parameters()) + list(self.mapping_network.parameters())
-                torch.nn.utils.clip_grad_norm_(g_params, self.grad_clip_max_norm)
-                self.scaler.step(self.optimizer_g)
-                self.scaler.update()
+                g_grad_norm = torch.nn.utils.clip_grad_norm_(g_params, self.grad_clip_max_norm)
+                if torch.isfinite(g_grad_norm):
+                    self.scaler.step(self.optimizer_g)
+                else:
+                    print(f"WARNING: NaN grad in G at step {self.global_step}, skipping update")
+                self.scaler.update()  # Always update scaler
                 self.optimizer_g.zero_grad()
                 if self.ema_g:
                     self.ema_g.update()
@@ -377,13 +425,14 @@ class Trainer:
                 if self.ema_g:
                     self.ema_g.update()
         
-        losses = {f'd_{k}': v.item() for k, v in d_losses.items()}
-        losses.update({f'g_{k}': v.item() for k, v in g_losses.items()})
-        
-        # Check for NaN in losses
-        for k, v in losses.items():
-            if not torch.isfinite(torch.tensor(v)):
-                raise RuntimeError(f"NaN detected in loss '{k}' at step {self.global_step}. Training stopped to prevent checkpoint corruption.")
+        # Collect losses for logging (with NaN protection)
+        losses = {}
+        for k, v in d_losses.items():
+            val = v.item() if torch.isfinite(v) else 0.0
+            losses[f'd_{k}'] = val
+        for k, v in g_losses.items():
+            val = v.item() if torch.isfinite(v) else 0.0
+            losses[f'g_{k}'] = val
         
         return losses
     
